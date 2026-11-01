@@ -6,6 +6,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wgpu::TextureFormat;
 
+/// Бэкенды для новых окон (0 — по умолчанию Vulkan | GL, Vulkan выбирается первым).
+static BACKENDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Задать бэкенды wgpu до создания первого окна, например только `Backends::GL`.
+pub fn set_preferred_backends(backends: wgpu::Backends) {
+    BACKENDS.store(backends.bits(), Ordering::Relaxed);
+}
+
+fn preferred_backends() -> wgpu::Backends {
+    match wgpu::Backends::from_bits_truncate(BACKENDS.load(Ordering::Relaxed)) {
+        b if b.is_empty() => wgpu::Backends::VULKAN | wgpu::Backends::GL,
+        b => b,
+    }
+}
+
 pub struct WgpuContext {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -79,6 +94,57 @@ impl WgpuContext {
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
         Self::new_with_options(instance, surface, compositor_gpu, true)
+    }
+
+    /// Контекст на чужом, уже текущем GL-контексте (например, EGL приложения из общей группы с его рендером):
+    /// wgpu не создаёт свой EGL и не переключает контексты. Окон у такого контекста нет — только
+    /// [`WgpuRenderer::new_offscreen`](crate::WgpuRenderer::new_offscreen).
+    ///
+    /// # Safety
+    /// GL-контекст текущий в этом потоке сейчас, при каждом вызове wgpu с этим контекстом и его объектами
+    /// и при их удалении; `get_proc_address` отдаёт функции этого контекста (eglGetProcAddress).
+    #[cfg(target_os = "android")]
+    pub unsafe fn new_external_gl(
+        get_proc_address: impl FnMut(&str) -> *const std::ffi::c_void,
+    ) -> anyhow::Result<Self> {
+        // SAFETY: по договору функции контекст текущий.
+        let exposed = unsafe {
+            wgpu::hal::gles::Adapter::new_external(get_proc_address, wgpu::GlBackendOptions::default())
+        }
+        .context("GL: адаптер на чужом контексте не создан")?;
+        // Без бэкендов: своих адаптеров (и своего EGL) экземпляру не нужно, адаптер — из hal.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::empty(),
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+            display: None,
+        });
+        // SAFETY: адаптер создан из hal того же процесса, экземпляр без своих бэкендов ничего с ним не делит.
+        let adapter = unsafe { instance.create_adapter_from_hal(exposed) };
+        let (device, queue, dual_source_blending, color_texture_format) =
+            gpui::block_on(Self::create_device(&adapter))?;
+        let device_lost = Arc::new(AtomicBool::new(false));
+        device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+        log::info!("GPU на чужом GL-контексте: {:?}", adapter.get_info().name);
+        Ok(Self {
+            instance,
+            adapter,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            backend: WgpuBackend::Native(wgpu::Backend::Gl),
+            dual_source_blending,
+            color_texture_format,
+            device_lost,
+        })
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -289,7 +355,7 @@ impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            backends: preferred_backends(),
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -503,7 +569,8 @@ impl WgpuContext {
         let required_usages = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
         let bgra_features = adapter.get_texture_format_features(wgpu::TextureFormat::Bgra8Unorm);
         let rgba_features = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba8Unorm);
-        #[cfg(target_family = "wasm")]
+        // GLES (и WebGL): BGRA-текстура заливается с ошибкой «pixel buffer format is not compatible» (Adreno 619),
+        // атлас остаётся пустым — нет текста и картинок. RGBA с перестановкой байт при заливке работает.
         if adapter.get_info().backend == wgpu::Backend::Gl
             && rgba_features.allowed_usages.contains(required_usages)
         {
