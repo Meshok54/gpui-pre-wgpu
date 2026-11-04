@@ -232,6 +232,9 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// Текстуры хоста для `PaintSurface` (Android), создаются при первой `set_host_texture`.
+    #[cfg(target_os = "android")]
+    host: Option<crate::host_texture::HostTextures>,
 }
 
 impl WgpuRenderer {
@@ -633,7 +636,21 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            #[cfg(target_os = "android")]
+            host: None,
         })
+    }
+
+    /// Текстура хоста под номером `id` для элементов `Window::paint_host_texture` (None — убрать).
+    /// Строки — как у wgpu (первая — верх кадра), формат — любой читаемый float.
+    #[cfg(target_os = "android")]
+    pub fn set_host_texture(&mut self, id: u32, view: Option<&wgpu::TextureView>) {
+        let format = self.surface_config.format;
+        let Some(res) = self.resources.as_ref() else { return };
+        let device = std::sync::Arc::clone(&res.device);
+        self.host
+            .get_or_insert_with(|| crate::host_texture::HostTextures::new(&device, format))
+            .set(&device, id, view);
     }
 
     fn create_bind_group_layouts(
@@ -1484,6 +1501,8 @@ impl WgpuRenderer {
                     label: Some("main_encoder"),
                 });
 
+        #[cfg(target_os = "android")]
+        let mut host_slot = 0u64;
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main_pass"),
@@ -1584,8 +1603,15 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
+                    // На Android — текстуры хоста (камера); на других платформах WGPU их не рисует.
+                    #[cfg(target_os = "android")]
+                    PrimitiveBatch::Surfaces(surfaces) => {
+                        if let Some(host) = &self.host {
+                            let viewport = [self.surface_config.width as f32, self.surface_config.height as f32];
+                            host.draw(&self.resources().queue, &mut pass, &scene.surfaces[surfaces], viewport, &mut host_slot);
+                        }
+                    }
+                    #[cfg(not(target_os = "android"))]
                     PrimitiveBatch::Surfaces(_surfaces) => {}
                 }
             }

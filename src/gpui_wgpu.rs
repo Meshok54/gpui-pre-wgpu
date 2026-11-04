@@ -1,4 +1,5 @@
 mod compose;
+mod host_texture;
 mod cosmic_text_system;
 mod wgpu_atlas;
 mod wgpu_context;
