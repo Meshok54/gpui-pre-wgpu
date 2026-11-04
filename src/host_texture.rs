@@ -50,14 +50,14 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) local: vec2<f32> };
     if (px.x < p.mask.x || px.y < p.mask.y || px.x > p.mask.x + p.mask.z || px.y > p.mask.y + p.mask.w) {
         discard;
     }
-    // Точка кадра после поворота и зеркала → точка текстуры.
-    var q = v.local;
+    // Точка элемента → точка кадра (область uv — в кадре после поворота и зеркала) → точка текстуры.
+    var q = p.uv.xy + v.local * p.uv.zw;
     if (p.mirror == 1u) { q.x = 1.0 - q.x; }
     var tc = q;
     if (p.rotation == 90u) { tc = vec2<f32>(q.y, 1.0 - q.x); }
     else if (p.rotation == 180u) { tc = vec2<f32>(1.0 - q.x, 1.0 - q.y); }
     else if (p.rotation == 270u) { tc = vec2<f32>(1.0 - q.y, q.x); }
-    let c = textureSample(t, s, p.uv.xy + tc * p.uv.zw);
+    let c = textureSample(t, s, tc);
     // Скруглённый прямоугольник: радиус угла по четверти, в которой точка.
     let half = p.bounds.zw * 0.5;
     let d = px - (p.bounds.xy + half);
@@ -68,7 +68,8 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) local: vec2<f32> };
     let k = abs(d) - (half - vec2<f32>(r));
     let dist = length(max(k, vec2<f32>(0.0))) + min(max(k.x, k.y), 0.0) - r;
     let a = clamp(0.5 - dist, 0.0, 1.0);
-    return vec4<f32>(c.rgb * a, a);
+    // Цвет текстуры считается умноженным на альфу (у камеры альфа 1).
+    return c * a;
 }
 "#;
 

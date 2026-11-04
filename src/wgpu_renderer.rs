@@ -641,6 +641,11 @@ impl WgpuRenderer {
         })
     }
 
+    /// Устройство wgpu этого рендера.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.resources().device
+    }
+
     /// Текстура хоста под номером `id` для элементов `Window::paint_host_texture` (None — убрать).
     /// Строки — как у wgpu (первая — верх кадра), формат — любой читаемый float.
     #[cfg(target_os = "android")]
