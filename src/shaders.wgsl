@@ -536,6 +536,13 @@ struct QuadVarying {
     @location(3) @interpolate(flat) background_solid: vec4<f32>,
     @location(4) @interpolate(flat) background_color0: vec4<f32>,
     @location(5) @interpolate(flat) background_color1: vec4<f32>,
+    // Quad data for the fragment stage, so that it does not read the instance
+    // buffer per pixel (slow on mobile GLES): bounds, corner radii, border widths.
+    // `load_quad` per pixel only when `needs_load` (gradient, pattern, dashes).
+    @location(6) @interpolate(flat) q_bounds: vec4<f32>,
+    @location(7) @interpolate(flat) q_radii: vec4<f32>,
+    @location(8) @interpolate(flat) q_borders: vec4<f32>,
+    @location(9) @interpolate(flat) needs_load: u32,
 }
 
 @vertex
@@ -558,6 +565,12 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.border_color = hsla_to_rgba(quad.border_color);
     out.quad_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.q_bounds = vec4<f32>(quad.bounds.origin, quad.bounds.size);
+    let r = quad.corner_radii;
+    out.q_radii = vec4<f32>(r.top_left, r.top_right, r.bottom_right, r.bottom_left);
+    let b = quad.border_widths;
+    out.q_borders = vec4<f32>(b.top, b.right, b.bottom, b.left);
+    out.needs_load = select(0u, 1u, quad.background.tag != 0u || quad.border_style == 1u);
     return out;
 }
 
@@ -568,7 +581,17 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let quad = load_quad(input.quad_id);
+    var quad: Quad;
+    if (input.needs_load != 0u) {
+        quad = load_quad(input.quad_id);
+    } else {
+        // Solid background, solid border: everything needed came from the vertex stage.
+        quad.border_style = 0u;
+        quad.bounds = Bounds(input.q_bounds.xy, input.q_bounds.zw);
+        quad.background.tag = 0u;
+        quad.corner_radii = Corners(input.q_radii.x, input.q_radii.y, input.q_radii.z, input.q_radii.w);
+        quad.border_widths = Edges(input.q_borders.x, input.q_borders.y, input.q_borders.z, input.q_borders.w);
+    }
 
     let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
         input.background_solid, input.background_color0, input.background_color1);
