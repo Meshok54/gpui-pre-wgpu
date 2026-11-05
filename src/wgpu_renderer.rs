@@ -650,12 +650,23 @@ impl WgpuRenderer {
     /// Строки — как у wgpu (первая — верх кадра), формат — любой читаемый float.
     #[cfg(target_os = "android")]
     pub fn set_host_texture(&mut self, id: u32, view: Option<&wgpu::TextureView>) {
+        self.set_host_texture_kind(id, view, false);
+    }
+
+    /// Как [`Self::set_host_texture`], но вид внешней текстуры (`host_gl_texture_external`): кадр камеры без копии.
+    #[cfg(target_os = "android")]
+    pub fn set_host_texture_external(&mut self, id: u32, view: Option<&wgpu::TextureView>) {
+        self.set_host_texture_kind(id, view, true);
+    }
+
+    #[cfg(target_os = "android")]
+    fn set_host_texture_kind(&mut self, id: u32, view: Option<&wgpu::TextureView>, external: bool) {
         let format = self.surface_config.format;
         let Some(res) = self.resources.as_ref() else { return };
         let device = std::sync::Arc::clone(&res.device);
         self.host
             .get_or_insert_with(|| crate::host_texture::HostTextures::new(&device, format))
-            .set(&device, id, view);
+            .set(&device, id, view, external);
     }
 
     fn create_bind_group_layouts(

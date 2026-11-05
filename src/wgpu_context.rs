@@ -307,6 +307,11 @@ impl WgpuContext {
             .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
 
         let mut required_features = wgpu::Features::empty();
+        // Внешняя текстура (кадр камеры без копии, host_texture.rs) — где адаптер умеет (GLES с samplerExternalOES).
+        #[cfg(target_os = "android")]
+        if adapter.features().contains(wgpu::Features::EXTERNAL_TEXTURE) {
+            required_features |= wgpu::Features::EXTERNAL_TEXTURE;
+        }
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
         } else {

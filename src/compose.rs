@@ -140,6 +140,50 @@ impl Composer {
     }
 }
 
+/// Внешняя GL-текстура хоста (GL_TEXTURE_EXTERNAL_OES: кадр камеры из AHardwareBuffer) как текстура wgpu `w`x`h`
+/// для привязки `texture_external`, без копии. `None` — устройство не умеет внешние текстуры.
+/// Владеет ей хост: wgpu её не удалит.
+///
+/// # Safety
+/// `name` — живая внешняя текстура этого размера в группе текущего GL-контекста wgpu, живёт дольше результата.
+#[cfg(target_os = "android")]
+pub unsafe fn host_gl_texture_external(device: &wgpu::Device, name: u32, w: u32, h: u32) -> Option<wgpu::Texture> {
+    if !device.features().contains(wgpu::Features::EXTERNAL_TEXTURE) {
+        return None;
+    }
+    let raw = std::num::NonZeroU32::new(name)?;
+    let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+    let hal_desc = wgpu::hal::TextureDescriptor {
+        label: Some("host_gl_texture_external"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::wgt::TextureUses::RESOURCE,
+        memory_flags: wgpu::hal::MemoryFlags::empty(),
+        view_formats: Vec::new(),
+    };
+    // SAFETY: по договору функции имя — внешняя текстура (GL_TEXTURE_EXTERNAL_OES) в группе контекстов GPUI;
+    // drop_callback — wgpu её не удаляет.
+    let hal_tex = unsafe {
+        let dev = device.as_hal::<wgpu::hal::api::Gles>()?;
+        dev.texture_from_raw_external(raw, &hal_desc, Some(Box::new(|| {})))
+    };
+    let desc = wgpu::TextureDescriptor {
+        label: Some("host_gl_texture_external"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    };
+    // SAFETY: hal_tex создан на этом устройстве по desc выше.
+    Some(unsafe { device.create_texture_from_hal::<wgpu::hal::api::Gles>(hal_tex, &desc) })
+}
+
 /// GL-текстура хоста (из общей группы контекстов) как текстура wgpu, RGBA8 `w`x`h`, только для чтения в шейдере.
 /// Владеет ей хост: wgpu её не удалит.
 ///

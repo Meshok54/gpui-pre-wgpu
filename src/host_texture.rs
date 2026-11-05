@@ -136,11 +136,14 @@ struct Out { @builtin(position) pos: vec4<f32>, @location(0) local: vec2<f32> };
 pub(crate) struct HostTextures {
     pipeline: wgpu::RenderPipeline,
     ring_pipeline: wgpu::RenderPipeline,
+    /// Внешние текстуры (кадр камеры как есть, `texture_external` → samplerExternalOES), если устройство умеет.
+    external: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout)>,
     tex_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     params: wgpu::Buffer,
     params_group: wgpu::BindGroup,
-    textures: Vec<Option<wgpu::BindGroup>>,
+    /// Привязка текстуры под номером и внешняя ли она (какой конвейер её читает).
+    textures: Vec<Option<(wgpu::BindGroup, bool)>>,
 }
 
 impl HostTextures {
@@ -221,6 +224,60 @@ impl HostTextures {
             multiview_mask: None,
             cache: None,
         });
+        let external = device.features().contains(wgpu::Features::EXTERNAL_TEXTURE).then(|| {
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("host_texture_external"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::ExternalTexture,
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+            // Тот же шейдер, только текстура внешняя (на GLES — samplerExternalOES).
+            let src = SHADER
+                .replace("var t: texture_2d<f32>;", "var t: texture_external;")
+                .replace("textureSample(t, s, tc)", "textureSampleBaseClampToEdge(t, s, tc)");
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("host_texture_external"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("host_texture_external"),
+                bind_group_layouts: &[Some(&params_layout), Some(&layout)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("host_texture_external"),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend: Some(blend), write_mask: wgpu::ColorWrites::ALL })],
+                }),
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            (pipeline, layout)
+        });
         let ring_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("host_ring"),
             source: wgpu::ShaderSource::Wgsl(RING_SHADER.into()),
@@ -275,23 +332,34 @@ impl HostTextures {
                 }),
             }],
         });
-        Self { pipeline, ring_pipeline, tex_layout, sampler, params, params_group, textures: Vec::new() }
+        Self { pipeline, ring_pipeline, external, tex_layout, sampler, params, params_group, textures: Vec::new() }
     }
 
-    pub(crate) fn set(&mut self, device: &wgpu::Device, id: u32, view: Option<&wgpu::TextureView>) {
+    /// Текстура под номером `id`; `external` — вид внешней текстуры (`host_gl_texture_external`), её читает
+    /// свой конвейер. Внешнюю без поддержки устройства не ставит.
+    pub(crate) fn set(&mut self, device: &wgpu::Device, id: u32, view: Option<&wgpu::TextureView>, external: bool) {
         let i = id as usize;
         if self.textures.len() <= i {
             self.textures.resize_with(i + 1, || None);
         }
+        let layout = match (&self.external, external) {
+            (_, false) => &self.tex_layout,
+            (Some((_, l)), true) => l,
+            (None, true) => {
+                self.textures[i] = None;
+                return;
+            }
+        };
         self.textures[i] = view.map(|v| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("host_texture"),
-                layout: &self.tex_layout,
+                layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(v) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 ],
-            })
+            });
+            (group, external)
         });
     }
 
@@ -330,7 +398,11 @@ impl HostTextures {
                 *slot += 1;
                 continue;
             }
-            let Some(Some(tex)) = self.textures.get(s.texture.id as usize) else { continue };
+            let Some(Some((tex, external))) = self.textures.get(s.texture.id as usize) else { continue };
+            let pipeline = match (&self.external, *external) {
+                (Some((p, _)), true) => p,
+                _ => &self.pipeline,
+            };
             let r = s.corner_radii;
             let params = Params {
                 bounds: [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0],
@@ -343,7 +415,7 @@ impl HostTextures {
             };
             let offset = *slot * STRIDE;
             queue.write_buffer(&self.params, offset, bytemuck::bytes_of(&params));
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.params_group, &[offset as u32]);
             pass.set_bind_group(1, tex, &[]);
             pass.draw(0..4, 0..1);
